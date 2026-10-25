@@ -22,22 +22,21 @@
  	sweet_usb_probe();
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_nvt.c
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,197 @@
 +/*
-+ * SURYA (Poco X3 NFC) Novatek NVT-ts-spi bring-up, stage 1.
++ * SURYA (Poco X3 NFC) Novatek NVT-ts-spi bring-up, stage 2.
 + *
-+ * READ-ONLY diagnostics. This file performs no MMIO writes, no GPIO writes,
-+ * no RPMh votes and no clock votes. It only prints what the firmware (ABL)
-+ * left behind, so the next stage can be written against facts:
-+ *   - TLMM config/IO of GPIO 0..10 in three tiles (which tile holds which pin)
-+ *   - GCC clock vote word and the QUPV3 wrapper0 / SE0 bits
-+ *   - SE0 (0x880000) firmware protocol, only if its clocks are already on
++ * Boot-arg sweettouchnvt=<mode> (keep sweettouch=0 so sweet's Goodix probe
++ * stays off). Delay before starting: sweettouchdelay=<seconds>, default 45.
++ *   1  read-only: TLMM pins, GCC vote word, GCC wrapper0/wrapper1 registers
++ *   2  mode 1, then vote the wrapper0 + SE0 clock bits and dump GCC again
++ *   3  mode 2, then (after a pause so the log reaches disk) read SE0 registers
++ * Nothing here touches the touch IC, its reset/IRQ GPIOs, pin muxes, RPMh
++ * rails or RCG configuration. The only write is the clock vote in mode 2/3.
 + *
-+ * Device tree facts (surya): spi2.0 "NVT-ts-spi" on 880000.spi, reset GPIO 8,
-+ * irq GPIO 9 (edge), 8 MHz max, supplies touch_lab/touch_ibb/touch_vddio.
-+ *
-+ * Enable with boot-arg sweettouchnvt=1 (and keep sweettouch=0 so the Goodix
-+ * probe for sweet stays off). Delay: sweettouchdelay=<seconds>, default 45.
++ * Stage 1 facts (boot6): GPIO0-3 live in the SOUTH tile, 4-10 in NORTH; all
++ * of GPIO0-3 are plain GPIO inputs (not muxed to QUP); reset GPIO8 is an
++ * input pulled down (IC held in reset); GCC vote 0x41000000 (wrapper0 off).
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -57,10 +56,10 @@
 +#define NVT_SE_PA        0x00880000u
 +#define NVT_GCC_PA       0x00100000u
 +#define NVT_TLMM_N_PA    0x03900000u
-+#define NVT_TLMM_W_PA    0x03500000u
 +#define NVT_TLMM_S_PA    0x03d00000u
 +#define NVT_GCC_VOTE     0x5200cu
-+/* wrapper0 on this SoC family: M_AHB 6, S_AHB 7, CORE 8, CORE_2X 9, SE0 10. */
++/* Same layout as sweet's wrapper1 bits 18-21 + 23: wrapper0 is bits 6-9,
++ * its SE0 bit 10. Verified only by the dump this stage prints. */
 +#define NVT_WRAP0_MASK   0x000007c0u
 +#define NVT_GPIO_CFG(n)  ((uint32_t)(n) * 0x1000u)
 +#define NVT_GPIO_IO(n)   (NVT_GPIO_CFG(n) + 4u)
@@ -76,6 +75,7 @@
 +
 +static int nvt_sleep_chan;
 +static bool nvt_started;
++static int nvt_mode;
 +
 +static uint32_t
 +nvt_rd(vm_offset_t base, uint32_t off)
@@ -83,6 +83,14 @@
 +	uint32_t v = *(volatile uint32_t *)(base + off);
 +	__asm__ volatile("dmb oshld" ::: "memory");
 +	return v;
++}
++
++static void
++nvt_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
 +}
 +
 +static void
@@ -111,6 +119,29 @@
 +	}
 +}
 +
++/* Four registers per line, read-only. */
++static void
++nvt_dump(vm_offset_t gcc, const char *tag, uint32_t from, uint32_t to)
++{
++	for (uint32_t off = from; off < to; off += 16u) {
++		printf("SWEET NVT: %s %#x: %08x %08x %08x %08x\n", tag, off,
++		    nvt_rd(gcc, off), nvt_rd(gcc, off + 4u),
++		    nvt_rd(gcc, off + 8u), nvt_rd(gcc, off + 12u));
++	}
++}
++
++static void
++nvt_gcc_dump(vm_offset_t gcc, const char *tag)
++{
++	printf("SWEET NVT: %s vote=%#x wrap0 bits6-10=%#x wrap1 bits18-23=%#x\n", tag,
++	    nvt_rd(gcc, NVT_GCC_VOTE), (nvt_rd(gcc, NVT_GCC_VOTE) >> 6) & 0x1fu,
++	    (nvt_rd(gcc, NVT_GCC_VOTE) >> 18) & 0x3fu);
++	nvt_dump(gcc, tag, 0x17000u, 0x17050u);  /* wrapper0 block */
++	nvt_dump(gcc, tag, 0x17140u, 0x17160u);  /* wrapper0 local S1 slot */
++	nvt_dump(gcc, tag, 0x18000u, 0x18030u);  /* wrapper1 block (sweet: known) */
++	nvt_dump(gcc, tag, 0x18140u, 0x18160u);  /* wrapper1 S1 = sweet SE7 */
++}
++
 +static void
 +nvt_thread(void *arg, wait_result_t result)
 +{
@@ -118,35 +149,40 @@
 +	(void)arg;
 +	(void)result;
 +	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
-+	printf("SWEET NVT: stage 1 (read-only) starting in %u s\n", delay_s);
++	printf("SWEET NVT: stage 2 mode %d starting in %u s\n", nvt_mode, delay_s);
 +	nvt_wait(delay_s * 1000u);
 +
 +	vm_offset_t gcc = ml_io_map(NVT_GCC_PA, 0x60000);
 +	vm_offset_t tn = ml_io_map(NVT_TLMM_N_PA, 0x10000);
-+	vm_offset_t tw = ml_io_map(NVT_TLMM_W_PA, 0x10000);
 +	vm_offset_t ts = ml_io_map(NVT_TLMM_S_PA, 0x10000);
-+	if (!gcc || !tn || !tw || !ts) {
++	if (!gcc || !tn || !ts) {
 +		printf("SWEET NVT: MMIO mapping failed\n");
 +		goto out;
 +	}
-+
-+	for (unsigned pin = 0; pin <= 10; ++pin) {
-+		printf("SWEET NVT: gpio%u cfg/io N=%#x/%#x W=%#x/%#x S=%#x/%#x\n", pin,
-+		    nvt_rd(tn, NVT_GPIO_CFG(pin)), nvt_rd(tn, NVT_GPIO_IO(pin)),
-+		    nvt_rd(tw, NVT_GPIO_CFG(pin)), nvt_rd(tw, NVT_GPIO_IO(pin)),
++	for (unsigned pin = 0; pin <= 3; ++pin) {
++		printf("SWEET NVT: gpio%u S cfg/io=%#x/%#x\n", pin,
 +		    nvt_rd(ts, NVT_GPIO_CFG(pin)), nvt_rd(ts, NVT_GPIO_IO(pin)));
 +	}
-+
-+	uint32_t vote = nvt_rd(gcc, NVT_GCC_VOTE);
-+	printf("SWEET NVT: GCC vote=%#x wrap0 m_ahb=%u s_ahb=%u core=%u core2x=%u se0=%u\n",
-+	    vote, (vote >> 6) & 1u, (vote >> 7) & 1u, (vote >> 8) & 1u,
-+	    (vote >> 9) & 1u, (vote >> 10) & 1u);
-+
-+	if ((vote & NVT_WRAP0_MASK) != NVT_WRAP0_MASK) {
-+		printf("SWEET NVT: wrapper0/SE0 clocks are off; SE0 not touched (stage 2 must vote them)\n");
++	for (unsigned pin = 8; pin <= 9; ++pin) {
++		printf("SWEET NVT: gpio%u N cfg/io=%#x/%#x\n", pin,
++		    nvt_rd(tn, NVT_GPIO_CFG(pin)), nvt_rd(tn, NVT_GPIO_IO(pin)));
++	}
++	nvt_gcc_dump(gcc, "before");
++	if (nvt_mode < 2) {
 +		goto out;
 +	}
 +
++	printf("SWEET NVT: voting wrapper0+SE0 clocks (mask %#x)\n", NVT_WRAP0_MASK);
++	nvt_wr(gcc, NVT_GCC_VOTE, nvt_rd(gcc, NVT_GCC_VOTE) | NVT_WRAP0_MASK);
++	nvt_wait(5);
++	nvt_gcc_dump(gcc, "after");
++	if (nvt_mode < 3) {
++		goto out;
++	}
++
++	/* Let the persistent log reach disk: if the SE0 read hangs, keep the dump. */
++	printf("SWEET NVT: pausing 10 s before reading SE0\n");
++	nvt_wait(10000);
 +	vm_offset_t se = ml_io_map(NVT_SE_PA, 0x4000);
 +	if (!se) {
 +		printf("SWEET NVT: SE0 mapping failed\n");
@@ -159,7 +195,7 @@
 +	printf("SWEET NVT: se0 cmd=%#x irq=%#x ios=%#x\n",
 +	    nvt_rd(se, SE_CMD), nvt_rd(se, SE_IRQ), nvt_rd(se, SE_IOS));
 +out:
-+	printf("SWEET NVT: stage 1 done\n");
++	printf("SWEET NVT: stage 2 done\n");
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
@@ -167,14 +203,13 @@
 +void
 +sweet_touch_nvt_init(void)
 +{
-+	int enabled = 0;
 +	thread_t thread;
 +	if (nvt_started) {
 +		return;
 +	}
 +	nvt_started = true;
-+	(void)PE_parse_boot_argn("sweettouchnvt", &enabled, sizeof(enabled));
-+	if (!enabled) {
++	(void)PE_parse_boot_argn("sweettouchnvt", &nvt_mode, sizeof(nvt_mode));
++	if (nvt_mode <= 0) {
 +		return;
 +	}
 +	kern_return_t kr = kernel_thread_start(nvt_thread, NULL, &thread);
